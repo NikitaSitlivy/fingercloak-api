@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: fingercloak-api
+    env: node
+    region: frankfurt
+    plan: free
+    buildCommand: 'npm ci'
+    startCommand: 'npm start'
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ALLOWED_ORIGINS
+        value: 'https://fingercloak.com,https://www.fingercloak.com'
