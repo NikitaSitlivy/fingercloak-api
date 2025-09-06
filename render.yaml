@@ -19,3 +19,5 @@ services:
         value: '3e8c6c47b6e048b9b2d64a9c71a93f44'
       - key: INDEXNOW_KEY_LOCATION
         value: 'https://fingercloak.com/3e8c6c47b6e048b9b2d64a9c71a93f44.txt'
+      - key: FP_SALT
+        generateValue: true
