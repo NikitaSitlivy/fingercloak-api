@@ -13,3 +13,9 @@ services:
         value: production
       - key: ALLOWED_ORIGINS
         value: 'https://fingercloak.com,https://www.fingercloak.com'
+      - key: INDEXNOW_HOST
+        value: 'fingercloak.com'
+      - key: INDEXNOW_KEY
+        value: '3e8c6c47b6e048b9b2d64a9c71a93f44'
+      - key: INDEXNOW_KEY_LOCATION
+        value: 'https://fingercloak.com/3e8c6c47b6e048b9b2d64a9c71a93f44.txt'
