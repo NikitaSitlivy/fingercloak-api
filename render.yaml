@@ -1,11 +1,11 @@
 services:
   - type: web
     name: fingercloak-api
-    env: node
+    runtime: node
     region: frankfurt
     plan: free
-    buildCommand: 'npm ci'
-    startCommand: 'npm start'
+    buildCommand: "npm ci"
+    startCommand: "npm start"
     autoDeploy: true
     healthCheckPath: /health
     envVars:
@@ -14,13 +14,19 @@ services:
 
       # ВСЕ фронтовые origin'ы через запятую (без путей)
       - key: ALLOWED_ORIGINS
-        value: 'https://fingercloak.com,https://www.fingercloak.com,https://nikitasitlivy.github.io,http://localhost:5173,http://127.0.0.1:5173'
+        value: "https://fingercloak.com,https://www.fingercloak.com,https://nikitasitlivy.github.io,http://localhost:5173,http://127.0.0.1:5173"
 
       - key: INDEXNOW_HOST
-        value: 'fingercloak.com'
+        value: "fingercloak.com"
       - key: INDEXNOW_KEY
-        value: '3e8c6c47b6e048b9b2d64a9c71a93f44'
+        sync: false
       - key: INDEXNOW_KEY_LOCATION
-        value: 'https://fingercloak.com/3e8c6c47b6e048b9b2d64a9c71a93f44.txt'
-      - key: FP_SALT
-        generateValue: true
+        value: "https://fingercloak.com/indexnow.txt"
+
+      # соль для анонимизации IP/ключей — выставь секретом
+      - key: IP_HMAC_SALT
+        sync: false
+
+      # опционально: если на сервис добавлен persistent disk — будем писать JSONL
+      # - key: WRITE_DIR
+      #   value: "/data"

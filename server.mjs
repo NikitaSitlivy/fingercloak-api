@@ -5,16 +5,18 @@ import morgan from 'morgan';
 import { sendIndexNow } from './indexnow.mjs';
 import {
   saveFingerprint, getFingerprint, compareFingerprints,
+  searchSnapshots, getSession, getStats, getVersionInfo, extractClientIp
 } from './fp.mjs';
 
 const app = express();
 
-// Security headers & logs
+/* Security headers & logs */
+app.disable('x-powered-by');
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(express.json({ limit: '1mb' }));
 
-// CORS
+/* CORS */
 const ALLOWED = (process.env.ALLOWED_ORIGINS || 'https://fingercloak.com,https://www.fingercloak.com')
   .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -27,17 +29,20 @@ app.use(cors({
   credentials: true
 }));
 
-// Health & sample
+/* Trust proxy (Render) */
+if (process.env.TRUST_PROXY !== 'false') {
+  app.set('trust proxy', true);
+}
+
+/* Health & sample */
 app.get('/health', (req, res) => res.json({ ok: true, env: process.env.NODE_ENV || 'dev', ts: Date.now() }));
 app.get('/ping', (req, res) => res.type('text').send('pong'));
-app.get('/api/version', (req, res) => res.json({ api: 'fingercloak', version: '1.1.0' }));
+app.get('/api/version', (req, res) => res.json(getVersionInfo()));
 app.get('/api/echo', (req, res) => res.json({ query: req.query, headers: req.headers }));
 
 /* ------------ SEO helpers: sitemap & feed ------------- */
 const CANON = 'https://fingercloak.com';
-const STATIC_URLS = [
-  '/', '/lab', '/docs', '/privacy', '/terms'
-];
+const STATIC_URLS = ['/', '/lab', '/docs', '/privacy', '/terms'];
 
 app.get('/sitemap.xml', (req, res) => {
   const urls = STATIC_URLS
@@ -48,7 +53,6 @@ app.get('/sitemap.xml', (req, res) => {
 });
 
 app.get('/feed.xml', (req, res) => {
-  // простой фид — позже можем подцепить реальные релизы/посты
   const now = new Date().toUTCString();
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
   <rss version="2.0"><channel>
@@ -61,13 +65,13 @@ app.get('/feed.xml', (req, res) => {
   res.type('application/rss+xml').send(xml);
 });
 
-/* ---------------- IndexNow endpoint (как раньше) ---------------- */
+/* ---------------- IndexNow endpoint ---------------- */
 const COOL_DOWN_MS = 2000;
 const lastByIp = new Map();
 app.post('/api/indexnow', async (req, res) => {
   try {
     const now = Date.now();
-    const ip = req.headers['x-forwarded-for']?.toString().split(',')[0].trim() || req.socket.remoteAddress || 'local';
+    const ip = extractClientIp(req);
     const last = lastByIp.get(ip) || 0;
     if (now - last < COOL_DOWN_MS) return res.status(429).json({ error: 'Too Many Requests' });
     lastByIp.set(ip, now);
@@ -79,7 +83,7 @@ app.post('/api/indexnow', async (req, res) => {
     ];
     const host = process.env.INDEXNOW_HOST || 'fingercloak.com';
     const key = process.env.INDEXNOW_KEY;
-    const keyLocation = process.env.INDEXNOW_KEY_LOCATION || `https://${host}/${key}.txt`;
+    const keyLocation = process.env.INDEXNOW_KEY_LOCATION || `https://${host}/indexnow.txt`;
 
     const result = await sendIndexNow(list, { host, key, keyLocation });
     res.json({ ok: true, ...result, host, keyLocation });
@@ -91,36 +95,68 @@ app.post('/api/indexnow', async (req, res) => {
 /* ---------------- Fingerprint endpoints ---------------- */
 
 // собрать и вернуть id/хэш/флаги
+/* ---------------- Fingerprint endpoints ---------------- */
+
+// собрать и вернуть id/хэш/флаги
 app.post('/api/fp/collect', (req, res) => {
-  const ip = req.headers['x-forwarded-for']?.toString().split(',')[0].trim() || req.socket.remoteAddress;
+  const ip = extractClientIp(req);
   const ua = req.headers['user-agent'];
-  const payload = req.body?.payload ?? req.body; // принимаем и просто тело, и {payload}
+  const origin = req.headers['origin'] || null;
+  const payload = req.body?.payload ?? req.body;
+
   if (!payload || typeof payload !== 'object') {
     return res.status(400).json({ ok: false, error: 'payload required' });
   }
-  const entry = saveFingerprint({ ip, ua, payload });
-  res.json({
-    ok: true,
-    id: entry.id,
-    hash: entry.hash,
-    nonzero: entry.nonzero,
-    ts: entry.ts
-  });
+  try {
+    const entry = saveFingerprint({ ip, ua, origin, payload });
+    res.json({
+      ok: true,
+      id: entry.id,
+      hash: entry.contentHash ?? entry.hash ?? null,
+      nonzero: !!entry.nonzero,
+      ts: entry.ts
+    });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e.message || e) });
+  }
 });
 
-// получить сохранённый отпечаток (для страницы-демо и ссылок)
+// ⚠️ СНАЧАЛА — специфичные подпути:
+app.get('/api/fp/compare', (req, res) => {
+  const { a, b } = req.query;
+  if (!a || !b) return res.status(400).json({ ok: false, error: 'a and b required' });
+  const cmp = compareFingerprints(String(a), String(b));
+  if (!cmp) return res.status(404).json({ ok: false, error: 'one or both ids not found' });
+  res.json(cmp);
+});
+
+app.get('/api/fp/search', (req, res) => {
+  res.json(searchSnapshots(req.query));
+});
+
+app.get('/api/fp/session/:sid', (req, res) => {
+  const result = getSession(req.params.sid);
+  if (!result) return res.status(404).json({ ok: false, error: 'not found' });
+  res.json(result);
+});
+
+app.get('/api/fp/stats', (req, res) => {
+  res.json(getStats());
+});
+
+// И ТОЛЬКО ПОТОМ — “общий” маршрут по id.
+// Дополнительно сужаем маску id, чтобы не ловить "compare", "search" и т.п.
+app.get('/api/fp/:id([A-Za-z0-9_-]{6,64})', (req, res) => {
+  const item = getFingerprint(req.params.id);
+  if (!item) return res.status(404).json({ ok: false, error: 'not found' });
+  res.json(item);
+});
+
+// получить сохранённый снимок
 app.get('/api/fp/:id', (req, res) => {
   const item = getFingerprint(req.params.id);
   if (!item) return res.status(404).json({ ok: false, error: 'not found' });
-  res.json({
-    ok: true,
-    id: item.id,
-    ts: item.ts,
-    ua: item.ua,
-    hash: item.hash,
-    nonzero: item.nonzero,
-    payload: item.payload
-  });
+  res.json(item);
 });
 
 // сравнить два снимка
@@ -129,7 +165,24 @@ app.get('/api/fp/compare', (req, res) => {
   if (!a || !b) return res.status(400).json({ ok: false, error: 'a and b required' });
   const cmp = compareFingerprints(String(a), String(b));
   if (!cmp) return res.status(404).json({ ok: false, error: 'one or both ids not found' });
-  res.json({ ok: true, ...cmp });
+  res.json(cmp);
+});
+
+// поиск по снимкам (простые фильтры)
+app.get('/api/fp/search', (req, res) => {
+  res.json(searchSnapshots(req.query));
+});
+
+// все снимки по sessionId
+app.get('/api/fp/session/:sid', (req, res) => {
+  const result = getSession(req.params.sid);
+  if (!result) return res.status(404).json({ ok: false, error: 'not found' });
+  res.json(result);
+});
+
+// агрегированные метрики
+app.get('/api/fp/stats', (req, res) => {
+  res.json(getStats());
 });
 
 // 404

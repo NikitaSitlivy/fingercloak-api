@@ -1,126 +1,130 @@
-// fp.mjs — сбор/хэш/сравнение + in-memory storage
-import crypto from 'node:crypto';
+// fp.mjs — слой доменной логики вокруг normalize/hashing/store
+import { normalizePayload } from './normalize.mjs';
+import { hmacIp as anonIp, makeStableId, makeContentHash, hammingDistanceHex } from './hashing.mjs';
+import { saveSnapshot, getById, getBySession, search as storeSearch, stats as storeStats } from './store.mjs';
 
-const SALT = process.env.FP_SALT || 'change-me';
-const TTL_MS = 24 * 60 * 60 * 1000;
+const VERSION = '1.2.0';
 
-function stableStringify(obj) {
-  const seen = new WeakSet();
-  const order = (v) => {
-    if (v && typeof v === 'object') {
-      if (seen.has(v)) return null;
-      seen.add(v);
-      if (Array.isArray(v)) return v.map(order);
-      return Object.keys(v).sort().reduce((a, k) => (a[k] = order(v[k]), a), {});
-    }
-    return v;
-  };
-  return JSON.stringify(order(obj));
+// утилита для IP (учитываем прокси, если в server включён trust proxy)
+export function extractClientIp(req) {
+  return req.headers['x-forwarded-for']?.toString().split(',')[0].trim()
+    || req.ip
+    || req.socket?.remoteAddress
+    || 'local';
 }
 
-export function sha256Hex(s) {
-  return crypto.createHash('sha256').update(s).digest('hex');
+export function getVersionInfo() {
+  return { api: 'fingercloak', version: VERSION };
 }
 
-export function anonIp(ip) {
-  return sha256Hex(SALT + '|' + (ip || ''));
-}
+export function saveFingerprint({ ip, ua, origin = null, payload }) {
+  // нормализуем «сырой» снимок из лаборатории
+  const normalized = normalizePayload(payload, { ua });
 
-export function normalizePayload(p) {
-  // лёгкая нормализация: обрежем гигантские поля, приведём типы
-  const MAX = 8_192;
-  const safe = JSON.parse(JSON.stringify(p || {}, (_, v) => (
-    typeof v === 'string' && v.length > MAX ? v.slice(0, MAX) :
-    v
-  )));
-  return safe;
-}
+  // сессионный id/consent можно передавать с фронта в meta/consent
+  const sessionId = payload?.meta?.sessionId || null;
+  const consent = payload?.consent || null;
 
-export function fpHash(payload) {
-  const norm = normalizePayload(payload);
-  return sha256Hex(stableStringify(norm));
-}
+  // стабильные идентификаторы (ядро/контент)
+  const stableId = makeStableId(normalized);
+  const contentHash = makeContentHash(normalized);
 
-export function fpNonZero(payload) {
-  const s = stableStringify(payload);
-  // простая эвристика: есть ли хоть что-то кроме пустых/нулей
-  return /[1-9a-zA-Z]/.test(s);
-}
-
-export function similarity(a, b) {
-  // грубый косинус на множестве путей-ключей
-  const keysA = new Set(Object.keys(flatten(a)));
-  const keysB = new Set(Object.keys(flatten(b)));
-  const inter = [...keysA].filter(k => keysB.has(k)).length;
-  const denom = Math.sqrt(keysA.size * keysB.size) || 1;
-  return inter / denom; // 0..1
-}
-
-function flatten(obj, prefix = '', out = {}) {
-  if (obj && typeof obj === 'object') {
-    for (const [k, v] of Object.entries(obj)) {
-      flatten(v, prefix ? `${prefix}.${k}` : k, out);
-    }
-  } else {
-    out[prefix] = obj;
-  }
-  return out;
-}
-
-/* ---------- In-memory storage (swap to DB later) ---------- */
-const store = new Map(); // id -> { id, ts, ipHash, ua, hash, payload }
-function gc() {
-  const now = Date.now();
-  for (const [k, v] of store) if (now - v.ts > TTL_MS) store.delete(k);
-}
-setInterval(gc, 60_000).unref();
-
-export function saveFingerprint({ ip, ua, payload }) {
-  const norm = normalizePayload(payload);
-  const id = crypto.randomUUID();
   const entry = {
-    id,
-    ts: Date.now(),
-    ipHash: anonIp(ip),
+    ok: true,
+    // id/ts выставляет store (ниже при сохранении)
     ua: String(ua || ''),
-    hash: fpHash(norm),
-    nonzero: fpNonZero(norm),
-    payload: norm
+    origin,
+    ipHash: anonIp(ip),
+    sessionId,
+    consent,
+    schemaVersion: 1,
+    collectorVersion: payload?.collectorVersion || null,
+    ...normalized,
+    stableId,
+    contentHash,
+    nonzero: true
   };
-  store.set(id, entry);
-  return entry;
+
+  return saveSnapshot(entry); // возвращает снимок с id/ts
 }
 
 export function getFingerprint(id) {
-  return store.get(id) || null;
+  const s = getById(id);
+  if (!s) return null;
+  return { ok: true, ...s };
 }
 
 export function compareFingerprints(aId, bId) {
-  const A = getFingerprint(aId);
-  const B = getFingerprint(bId);
+  const A = getById(aId);
+  const B = getById(bId);
   if (!A || !B) return null;
-  const sim = similarity(A.payload, B.payload);
+
+  const sameStable = A.stableId === B.stableId;
+  const distHash = hammingDistanceHex(A.contentHash, B.contentHash);
+
+  // очень простой скор
+  let compat = 50;
+  if (sameStable) compat += 30;
+  compat -= Math.min(30, Math.round(distHash / 4));
+  if (A.env?.ua && B.env?.ua && A.env.ua.split('/')[0] === B.env.ua.split('/')[0]) compat += 10;
+  compat = Math.max(0, Math.min(100, compat));
+
   return {
-    aId, bId,
-    aHash: A.hash, bHash: B.hash,
-    sameHash: A.hash === B.hash,
-    similarity: sim,
-    delta: diffObjects(A.payload, B.payload).slice(0, 200) // лимит примеров
+    ok: true,
+    a: { id: A.id, ts: A.ts },
+    b: { id: B.id, ts: B.ts },
+    sameStable,
+    contentHashHamming: distHash,
+    compatScore: compat,
+    topFactors: explain(A, B),
+    diff: diffSnapshots(A, B)
   };
 }
 
-// очень простой дифф
-function diffObjects(a, b, path = '') {
-  const res = [];
-  const keys = new Set([...Object.keys(a || {}), ...Object.keys(b || {})]);
-  for (const k of keys) {
-    const p = path ? `${path}.${k}` : k;
-    const av = a?.[k], bv = b?.[k];
-    if (typeof av === 'object' && typeof bv === 'object' && av && bv) {
-      res.push(...diffObjects(av, bv, p));
-    } else if (JSON.stringify(av) !== JSON.stringify(bv)) {
-      res.push({ path: p, a: av, b: bv });
-    }
-  }
-  return res;
+function explain(a, b) {
+  const out = [];
+  if (a.stableId === b.stableId) out.push({ kind: 'pro', msg: 'stableId совпадает' });
+  if (a.env?.ua === b.env?.ua) out.push({ kind: 'pro', msg: 'User-Agent совпадает' });
+  if (a.webgl?.renderer === b.webgl?.renderer || a.webgl2?.renderer === b.webgl2?.renderer)
+    out.push({ kind: 'pro', msg: 'WebGL renderer совпадает' });
+  if (a.canvas?.hash && a.canvas.hash === b.canvas?.hash)
+    out.push({ kind: 'pro', msg: 'Canvas hash совпадает' });
+  if (a.audio?.hash && a.audio.hash === b.audio?.hash)
+    out.push({ kind: 'pro', msg: 'Audio hash совпадает' });
+
+  if (a.screen?.dpr !== b.screen?.dpr) out.push({ kind: 'con', msg: 'Разный DPR' });
+  if (a.intl?.timeZone !== b.intl?.timeZone) out.push({ kind: 'con', msg: 'Разный TimeZone' });
+  return out.slice(0, 6);
+}
+
+function diffSnapshots(a, b) {
+  const group = (key, fields) => {
+    const g = {};
+    for (const f of fields) g[f] = { a: a[key]?.[f] ?? null, b: b[key]?.[f] ?? null, same: (a[key]?.[f] ?? null) === (b[key]?.[f] ?? null) };
+    return g;
+  };
+  return {
+    env: group('env', ['ua', 'languages', 'platform', 'hardwareConcurrency', 'deviceMemory']),
+    screen: group('screen', ['dpr', 'colorDepth', 'touchPoints']),
+    webgl: group('webgl', ['vendor', 'renderer', 'maxTexture']),
+    webgl2: group('webgl2', ['vendor', 'renderer', 'maxTexture']),
+    webgpu: group('webgpu', ['supported']),
+    intl: group('intl', ['locale', 'timeZone']),
+    canvas: group('canvas', ['hash']),
+    audio: group('audio', ['hash'])
+  };
+}
+
+export function searchSnapshots(query) {
+  return storeSearch(query);
+}
+
+export function getSession(sessionId) {
+  const items = getBySession(sessionId);
+  if (!items.length) return null;
+  return { ok: true, sessionId, total: items.length, items: items.map(s => ({ id: s.id, ts: s.ts, scores: s.derived?.scores })) };
+}
+
+export function getStats() {
+  return storeStats();
 }
