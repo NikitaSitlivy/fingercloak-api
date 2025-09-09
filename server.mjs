@@ -2,11 +2,17 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
+
 import { sendIndexNow } from './indexnow.mjs';
 import {
   saveFingerprint, getFingerprint, compareFingerprints,
   searchSnapshots, getSession, getStats, getVersionInfo, extractClientIp
 } from './fp.mjs';
+
+import { headerOrderAndHash } from './header_utils.mjs';
+import { handleEdgeIngest } from './edge_ingest.mjs';
+import { handleDnsIngest } from './dns_ingest.mjs';
+import { handleWebrtcIngest } from './webrtc_ingest.mjs';
 
 const app = express();
 
@@ -14,7 +20,7 @@ const app = express();
 app.disable('x-powered-by');
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' })); // подняли лимит
 
 /* CORS */
 const ALLOWED = (process.env.ALLOWED_ORIGINS || 'https://fingercloak.com,https://www.fingercloak.com')
@@ -38,7 +44,11 @@ if (process.env.TRUST_PROXY !== 'false') {
 app.get('/health', (req, res) => res.json({ ok: true, env: process.env.NODE_ENV || 'dev', ts: Date.now() }));
 app.get('/ping', (req, res) => res.type('text').send('pong'));
 app.get('/api/version', (req, res) => res.json(getVersionInfo()));
-app.get('/api/echo', (req, res) => res.json({ query: req.query, headers: req.headers }));
+app.get('/api/echo', (req, res) => {
+  const httpVersion = req.httpVersion;
+  const { order, hash, sample } = headerOrderAndHash(req.rawHeaders);
+  res.json({ httpVersion, headerOrderHash: hash, headerOrder: order, headerSample: sample, query: req.query });
+});
 
 /* ------------ SEO helpers: sitemap & feed ------------- */
 const CANON = 'https://fingercloak.com';
@@ -92,9 +102,36 @@ app.post('/api/indexnow', async (req, res) => {
   }
 });
 
-/* ---------------- Fingerprint endpoints ---------------- */
+/* ---------------- Edge / DNS / WebRTC ingest ---------------- */
 
-// собрать и вернуть id/хэш/флаги
+app.post('/api/edge/ingest', (req, res) => {
+  try {
+    const shared = process.env.EDGE_SHARED_SECRET || '';
+    const result = handleEdgeIngest({ body: req.body, sharedSecret: shared });
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+app.post('/api/dns/ingest', (req, res) => {
+  try {
+    const result = handleDnsIngest(req.body);
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+app.post('/api/webrtc/ingest', (req, res) => {
+  try {
+    const result = handleWebrtcIngest(req.body);
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 /* ---------------- Fingerprint endpoints ---------------- */
 
 // собрать и вернуть id/хэш/флаги
@@ -144,45 +181,11 @@ app.get('/api/fp/stats', (req, res) => {
   res.json(getStats());
 });
 
-// И ТОЛЬКО ПОТОМ — “общий” маршрут по id.
-// Дополнительно сужаем маску id, чтобы не ловить "compare", "search" и т.п.
+// И ТОЛЬКО ПОТОМ — “общий” маршрут по id (сузили маску, чтобы не ловить compare/search).
 app.get('/api/fp/:id([A-Za-z0-9_-]{6,64})', (req, res) => {
   const item = getFingerprint(req.params.id);
   if (!item) return res.status(404).json({ ok: false, error: 'not found' });
   res.json(item);
-});
-
-// получить сохранённый снимок
-app.get('/api/fp/:id', (req, res) => {
-  const item = getFingerprint(req.params.id);
-  if (!item) return res.status(404).json({ ok: false, error: 'not found' });
-  res.json(item);
-});
-
-// сравнить два снимка
-app.get('/api/fp/compare', (req, res) => {
-  const { a, b } = req.query;
-  if (!a || !b) return res.status(400).json({ ok: false, error: 'a and b required' });
-  const cmp = compareFingerprints(String(a), String(b));
-  if (!cmp) return res.status(404).json({ ok: false, error: 'one or both ids not found' });
-  res.json(cmp);
-});
-
-// поиск по снимкам (простые фильтры)
-app.get('/api/fp/search', (req, res) => {
-  res.json(searchSnapshots(req.query));
-});
-
-// все снимки по sessionId
-app.get('/api/fp/session/:sid', (req, res) => {
-  const result = getSession(req.params.sid);
-  if (!result) return res.status(404).json({ ok: false, error: 'not found' });
-  res.json(result);
-});
-
-// агрегированные метрики
-app.get('/api/fp/stats', (req, res) => {
-  res.json(getStats());
 });
 
 // 404

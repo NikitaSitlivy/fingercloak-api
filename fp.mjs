@@ -2,8 +2,9 @@
 import { normalizePayload } from './normalize.mjs';
 import { hmacIp as anonIp, makeStableId, makeContentHash, hammingDistanceHex } from './hashing.mjs';
 import { saveSnapshot, getById, getBySession, search as storeSearch, stats as storeStats } from './store.mjs';
+import { takeChunks } from './chunks.mjs';
 
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 
 // утилита для IP (учитываем прокси, если в server включён trust proxy)
 export function extractClientIp(req) {
@@ -21,9 +22,19 @@ export function saveFingerprint({ ip, ua, origin = null, payload }) {
   // нормализуем «сырой» снимок из лаборатории
   const normalized = normalizePayload(payload, { ua });
 
-  // сессионный id/consent можно передавать с фронта в meta/consent
+  // corrId: используем meta.sessionId как объединяющий идентификатор
   const sessionId = payload?.meta?.sessionId || null;
   const consent = payload?.consent || null;
+
+  // подтянем частичные чанки (edge/dns/webrtc), если они приходили до collect
+  const chunks = sessionId ? takeChunks(sessionId) : null;
+  if (chunks) {
+    normalized.network = {
+      edge: chunks.edge || null,
+      dns: chunks.dns || null,
+      webrtc: chunks.webrtc || null
+    };
+  }
 
   // стабильные идентификаторы (ядро/контент)
   const stableId = makeStableId(normalized);
@@ -31,7 +42,6 @@ export function saveFingerprint({ ip, ua, origin = null, payload }) {
 
   const entry = {
     ok: true,
-    // id/ts выставляет store (ниже при сохранении)
     ua: String(ua || ''),
     origin,
     ipHash: anonIp(ip),
