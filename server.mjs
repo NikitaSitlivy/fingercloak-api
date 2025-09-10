@@ -20,6 +20,8 @@ import { handleTcpIngest } from './tcp_ingest.mjs';
 import { initGeoIP, lookupIp } from './geoip.mjs';
 import { getChunks } from './chunks.mjs';
 import { rdapLookup } from './rdap.mjs';
+import { cymruAsnLookup } from './rdap_cymru.mjs';
+
 
 const app = express();
 
@@ -162,7 +164,16 @@ app.post('/api/tcp/ingest', (req, res) => {
 });
 
 /* ---------------- Fingerprint endpoints ---------------- */
-
+async function waitUntilChunks(sid, kinds = [], timeoutMs = 1500, stepMs = 120) {
+  if (!sid || !kinds.length || timeoutMs <= 0) return false;
+  const t0 = Date.now();
+ while (Date.now() - t0 < timeoutMs) {
+    const parts = await getChunks(sid) || {};
+   if (kinds.every(k => parts?.[k])) return true;
+    await new Promise(r => setTimeout(r, stepMs));
+  }
+  return false;
+}
 // собрать и вернуть id/хэш/флаги
 app.post('/api/fp/collect', async (req, res) => {
   const ip = extractClientIp(req);
@@ -173,12 +184,34 @@ app.post('/api/fp/collect', async (req, res) => {
   if (!payload || typeof payload !== 'object') {
     return res.status(400).json({ ok: false, error: 'payload required' });
   }
-
+  // опциональное ожидание нужных чанков (webrtc,dns,tls,tcp,edge)
+ const waitFor = String(req.query.waitFor || '').split(',').map(s => s.trim()).filter(Boolean);
+ const timeoutMs = Number(req.query.timeoutMs || 0);
+ const sid = payload?.meta?.sessionId || null;
+  if (sid && waitFor.length && timeoutMs > 0) {
+    await waitUntilChunks(sid, waitFor, timeoutMs).catch(()=>{});
+ }
   // серверные обогащения:
   const { order, hash, sample } = headerOrderAndHash(req.rawHeaders);
   const headersSrv = { order, hash, sample };
-  const geoSrv = lookupIp(ip);
-  const rdap = await rdapLookup({ ip, asn: geoSrv?.asn || null });
+
+let geoSrv = lookupIp(ip) || {};
+let rdap = await rdapLookup({ ip, asn: geoSrv?.asn || null }).catch(() => null);
+
+if (process.env.RDAP_FALLBACK_CYMRU === '1' && (!rdap || !rdap.asn || !geoSrv?.asn)) {
+  const asnInfo = await cymruAsnLookup(ip).catch(() => null);
+  if (asnInfo) {
+    rdap = rdap || {};
+    rdap.asn = rdap.asn || asnInfo.asn;
+    rdap.org = rdap.org || asnInfo.org;
+    rdap.rir = rdap.rir || asnInfo.rir;
+
+    if (asnInfo.asn && !geoSrv.asn)   geoSrv.asn = asnInfo.asn;
+    if (asnInfo.org && !geoSrv.isp)   geoSrv.isp = asnInfo.org;
+    if (asnInfo.country && !geoSrv.country) geoSrv.country = asnInfo.country;
+  }
+}
+
 
   try {
     const entry = await saveFingerprint({ ip, ua, origin, payload, headersSrv, geoSrv, rdap });

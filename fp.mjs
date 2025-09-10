@@ -4,7 +4,7 @@ import { hmacIp as anonIp, makeStableId, makeContentHash, hammingDistanceHex } f
 import { saveSnapshot, getById, getBySession, search as storeSearch, stats as storeStats } from './store.mjs';
 import { takeChunks } from './chunks.mjs';
 
-const VERSION = '1.3.0';
+const VERSION = '1.3.1';
 
 // утилита для IP (учитываем прокси, если включён trust proxy)
 export function extractClientIp(req) {
@@ -38,18 +38,23 @@ export async function saveFingerprint({ ip, ua, origin = null, payload, headersS
   const chunks = sessionId ? await takeChunks(sessionId) : null;
 
   // 4) соберём network-раздел
-  const network = {};
-  if (headersSrv) network.headersSrv = headersSrv;
-  if (geoSrv)     network.geoSrv     = geoSrv;
-  if (rdap)       network.rdap       = rdap;
+const network = {};
+ // сначала подшиваем edge/dns/webrtc/tls/tcp
+ if (chunks?.edge)   network.edge   = chunks.edge;
+  if (chunks?.dns)    network.dns    = chunks.dns;
+ if (chunks?.webrtc) network.webrtc = chunks.webrtc;
+  if (chunks?.tls)    network.tls    = chunks.tls;
+ if (chunks?.tcp)    network.tcp    = chunks.tcp;
 
-  if (chunks) {
-    if (chunks.edge)   network.edge   = chunks.edge;
-    if (chunks.dns)    network.dns    = chunks.dns;
-    if (chunks.webrtc) network.webrtc = chunks.webrtc;
-    if (chunks.tls)    network.tls    = chunks.tls;
-    if (chunks.tcp)    network.tcp    = chunks.tcp;
-  }
+ // headers: если edge.headers уже есть — не дублируем headersSrv
+  const haveEdgeHeaders = !!network.edge?.headers;
+  if (!haveEdgeHeaders && headersSrv) network.headersSrv = headersSrv;
+
+ // geo: если edge.geo есть — не добавляем geoSrv
+ const haveEdgeGeo = !!network.edge?.geo;
+ if (!haveEdgeGeo && geoSrv) network.geoSrv = geoSrv;
+
+ if (rdap) network.rdap = rdap;
   if (Object.keys(network).length) {
     normalized.network = network;
   }
