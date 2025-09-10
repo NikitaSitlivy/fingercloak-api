@@ -13,10 +13,14 @@
     "cors": "^2.8.5",
     "dayjs": "^1.11.18",
     "express": "^4.19.2",
+    "geoip-lite": "^1.4.10",
     "helmet": "^7.1.0",
+    "ioredis": "^5.7.0",
+    "maxmind": "^5.0.0",
     "morgan": "^1.10.0",
     "nanoid": "^5.1.5",
-    "object-hash": "^3.0.0"
+    "object-hash": "^3.0.0",
+    "undici": "^7.16.0"
   },
   "devDependencies": {
     "cross-env": "^10.0.0"

@@ -1,0 +1,8 @@
+﻿{
+  "meta": { "when":"2025-09-09T12:00:00.000Z", "page":"http://localhost:5173/#/lab", "app":"FingerCloak Lab", "sessionId":"corr-LOCAL1" },
+  "env": { "ua":"TestUA/1.0", "languages":["en-US"], "platform":"win32", "cookiesEnabled":true },
+  "screen": { "colorDepth":24, "dpr":1.5, "touchPoints":0 },
+  "canvas": { "hash":"deadbeef", "w":300, "h":150 },
+  "audio": { "hash":"cafebabe" },
+  "intl": { "locale":"en-US", "timeZone":"UTC" }
+}

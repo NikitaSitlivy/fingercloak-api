@@ -1,12 +1,12 @@
-// fp.mjs — слой доменной логики вокруг normalize/hashing/store
+// fp.mjs — доменная логика вокруг normalize/hashing/store + серверные обогащения
 import { normalizePayload } from './normalize.mjs';
 import { hmacIp as anonIp, makeStableId, makeContentHash, hammingDistanceHex } from './hashing.mjs';
 import { saveSnapshot, getById, getBySession, search as storeSearch, stats as storeStats } from './store.mjs';
 import { takeChunks } from './chunks.mjs';
 
-const VERSION = '1.2.1';
+const VERSION = '1.3.0';
 
-// утилита для IP (учитываем прокси, если в server включён trust proxy)
+// утилита для IP (учитываем прокси, если включён trust proxy)
 export function extractClientIp(req) {
   return req.headers['x-forwarded-for']?.toString().split(',')[0].trim()
     || req.ip
@@ -18,28 +18,47 @@ export function getVersionInfo() {
   return { api: 'fingercloak', version: VERSION };
 }
 
-export function saveFingerprint({ ip, ua, origin = null, payload }) {
-  // нормализуем «сырой» снимок из лаборатории
+/**
+ * saveFingerprint теперь умеет принимать серверные обогащения:
+ *  - headersSrv: { order[], hash, sample[] }
+ *  - geoSrv:     { asn, isp, country, region, city }
+ *  - rdap:       { asn, org, country, rir }
+ *
+ * и склеивает частичные чанки (edge/dns/webrtc/tls/tcp) по sessionId (corrId).
+ */
+export async function saveFingerprint({ ip, ua, origin = null, payload, headersSrv = null, geoSrv = null, rdap = null }) {
+  // 1) нормализуем «сырой» снимок из лаборатории
   const normalized = normalizePayload(payload, { ua });
 
-  // corrId: используем meta.sessionId как объединяющий идентификатор
+  // 2) session/corrId
   const sessionId = payload?.meta?.sessionId || null;
   const consent = payload?.consent || null;
 
-  // подтянем частичные чанки (edge/dns/webrtc), если они приходили до collect
-  const chunks = sessionId ? takeChunks(sessionId) : null;
+  // 3) подтянем частичные чанки (edge/dns/webrtc/tls/tcp), если они приходили до collect
+  const chunks = sessionId ? await takeChunks(sessionId) : null;
+
+  // 4) соберём network-раздел
+  const network = {};
+  if (headersSrv) network.headersSrv = headersSrv;
+  if (geoSrv)     network.geoSrv     = geoSrv;
+  if (rdap)       network.rdap       = rdap;
+
   if (chunks) {
-    normalized.network = {
-      edge: chunks.edge || null,
-      dns: chunks.dns || null,
-      webrtc: chunks.webrtc || null
-    };
+    if (chunks.edge)   network.edge   = chunks.edge;
+    if (chunks.dns)    network.dns    = chunks.dns;
+    if (chunks.webrtc) network.webrtc = chunks.webrtc;
+    if (chunks.tls)    network.tls    = chunks.tls;
+    if (chunks.tcp)    network.tcp    = chunks.tcp;
+  }
+  if (Object.keys(network).length) {
+    normalized.network = network;
   }
 
-  // стабильные идентификаторы (ядро/контент)
-  const stableId = makeStableId(normalized);
+  // 5) стабильные идентификаторы (ядро/контент)
+  const stableId    = makeStableId(normalized);
   const contentHash = makeContentHash(normalized);
 
+  // 6) финальный снапшот
   const entry = {
     ok: true,
     ua: String(ua || ''),
@@ -55,7 +74,21 @@ export function saveFingerprint({ ip, ua, origin = null, payload }) {
     nonzero: true
   };
 
-  return saveSnapshot(entry); // возвращает снимок с id/ts
+  const saved = saveSnapshot(entry);
+
+  // 7) служебные флаги — что из network было найдено
+  const networkFound = {
+    edge:       !!network.edge,
+    dns:        !!network.dns,
+    webrtc:     !!network.webrtc,
+    tls:        !!network.tls,
+    tcp:        !!network.tcp,
+    headersSrv: !!network.headersSrv,
+    geoSrv:     !!network.geoSrv,
+    rdap:       !!network.rdap
+  };
+
+  return { ...saved, networkFound };
 }
 
 export function getFingerprint(id) {
@@ -72,7 +105,6 @@ export function compareFingerprints(aId, bId) {
   const sameStable = A.stableId === B.stableId;
   const distHash = hammingDistanceHex(A.contentHash, B.contentHash);
 
-  // очень простой скор
   let compat = 50;
   if (sameStable) compat += 30;
   compat -= Math.min(30, Math.round(distHash / 4));

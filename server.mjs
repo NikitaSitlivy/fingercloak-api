@@ -1,3 +1,4 @@
+// server.mjs — основной HTTP сервер (Express)
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -13,6 +14,12 @@ import { headerOrderAndHash } from './header_utils.mjs';
 import { handleEdgeIngest } from './edge_ingest.mjs';
 import { handleDnsIngest } from './dns_ingest.mjs';
 import { handleWebrtcIngest } from './webrtc_ingest.mjs';
+import { handleTlsIngest } from './tls_ingest.mjs';
+import { handleTcpIngest } from './tcp_ingest.mjs';
+
+import { initGeoIP, lookupIp } from './geoip.mjs';
+import { getChunks } from './chunks.mjs';
+import { rdapLookup } from './rdap.mjs';
 
 const app = express();
 
@@ -39,6 +46,9 @@ app.use(cors({
 if (process.env.TRUST_PROXY !== 'false') {
   app.set('trust proxy', true);
 }
+
+/* Init GeoIP (async, без блокировки старта) */
+initGeoIP().catch(()=>{});
 
 /* Health & sample */
 app.get('/health', (req, res) => res.json({ ok: true, env: process.env.NODE_ENV || 'dev', ts: Date.now() }));
@@ -102,12 +112,22 @@ app.post('/api/indexnow', async (req, res) => {
   }
 });
 
-/* ---------------- Edge / DNS / WebRTC ingest ---------------- */
+/* ---------------- Ingest endpoints ---------------- */
 
 app.post('/api/edge/ingest', (req, res) => {
   try {
     const shared = process.env.EDGE_SHARED_SECRET || '';
     const result = handleEdgeIngest({ body: req.body, sharedSecret: shared });
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+app.post('/api/tls/ingest', (req, res) => {
+  try {
+    const shared = process.env.TLS_SHARED_SECRET || process.env.EDGE_SHARED_SECRET || '';
+    const result = handleTlsIngest({ body: req.body, sharedSecret: shared });
     res.json(result);
   } catch (e) {
     res.status(400).json({ ok: false, error: String(e.message || e) });
@@ -132,10 +152,19 @@ app.post('/api/webrtc/ingest', (req, res) => {
   }
 });
 
+app.post('/api/tcp/ingest', (req, res) => {
+  try {
+    const result = handleTcpIngest(req.body);
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 /* ---------------- Fingerprint endpoints ---------------- */
 
 // собрать и вернуть id/хэш/флаги
-app.post('/api/fp/collect', (req, res) => {
+app.post('/api/fp/collect', async (req, res) => {
   const ip = extractClientIp(req);
   const ua = req.headers['user-agent'];
   const origin = req.headers['origin'] || null;
@@ -144,14 +173,22 @@ app.post('/api/fp/collect', (req, res) => {
   if (!payload || typeof payload !== 'object') {
     return res.status(400).json({ ok: false, error: 'payload required' });
   }
+
+  // серверные обогащения:
+  const { order, hash, sample } = headerOrderAndHash(req.rawHeaders);
+  const headersSrv = { order, hash, sample };
+  const geoSrv = lookupIp(ip);
+  const rdap = await rdapLookup({ ip, asn: geoSrv?.asn || null });
+
   try {
-    const entry = saveFingerprint({ ip, ua, origin, payload });
+    const entry = await saveFingerprint({ ip, ua, origin, payload, headersSrv, geoSrv, rdap });
     res.json({
       ok: true,
       id: entry.id,
       hash: entry.contentHash ?? entry.hash ?? null,
       nonzero: !!entry.nonzero,
-      ts: entry.ts
+      ts: entry.ts,
+      networkFound: entry.networkFound || null
     });
   } catch (e) {
     res.status(400).json({ ok: false, error: String(e.message || e) });
@@ -179,6 +216,16 @@ app.get('/api/fp/session/:sid', (req, res) => {
 
 app.get('/api/fp/stats', (req, res) => {
   res.json(getStats());
+});
+
+/* Диагностика чанков (по corrId/sessionId) */
+app.get('/api/fp/debug/chunks/:sid', async (req, res) => {
+  try {
+    const parts = await getChunks(req.params.sid);
+    res.json({ ok: true, corrId: req.params.sid, parts: parts || null });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e.message || e) });
+  }
 });
 
 // И ТОЛЬКО ПОТОМ — “общий” маршрут по id (сузили маску, чтобы не ловить compare/search).

@@ -12,10 +12,19 @@ services:
       - key: NODE_ENV
         value: production
 
-      # ВСЕ фронтовые origin'ы через запятую (без путей)
+      # Разрешённые фронтовые origin'ы (без путей), через запятую
       - key: ALLOWED_ORIGINS
-        value: "https://fingercloak.com,https://www.fingercloak.com,https://nikitasitlivy.github.io,http://localhost:5173,http://127.0.0.1:5173"
+        value: "https://fingercloak.com,https://www.fingercloak.com,https://nikitasitlivy.github.io"
 
+      # Доверять X-Forwarded-For (Render проксирует IP)
+      - key: TRUST_PROXY
+        value: "true"
+
+      # Соль для HMAC анонимизации IP — установить секретом
+      - key: IP_HMAC_SALT
+        sync: false
+
+      # IndexNow (если используешь)
       - key: INDEXNOW_HOST
         value: "fingercloak.com"
       - key: INDEXNOW_KEY
@@ -23,10 +32,28 @@ services:
       - key: INDEXNOW_KEY_LOCATION
         value: "https://fingercloak.com/indexnow.txt"
 
-      # соль для анонимизации IP/ключей — выставь секретом
-      - key: IP_HMAC_SALT
+      # HMAC для ingest-запросов с Edge/TLS сенсора (если включены)
+      - key: EDGE_SHARED_SECRET
+        sync: false
+      - key: TLS_SHARED_SECRET
         sync: false
 
-      # опционально: если на сервис добавлен persistent disk — будем писать JSONL
+      # Redis (опционально — если несколько инстансов/нужно переживать рестарты/увеличить TTL чанков)
+      # - key: REDIS_URL
+      #   value: "redis://:password@redis-host:6379/0"
+
+      # GeoIP mmdb (опционально; если не задано — используем geoip-lite)
+      # - key: GEOIP_ASN_DB
+      #   value: "/opt/data/GeoLite2-ASN.mmdb"
+      # - key: GEOIP_CITY_DB
+      #   value: "/opt/data/GeoLite2-City.mmdb"
+
+      # Включить RDAP/WHOIS обогащение (через rdap.org)
+      - key: RDAP_ENABLE
+        value: "1"
+      - key: RDAP_TIMEOUT_MS
+        value: "4000"
+
+      # Писать JSONL снапшоты на диск (если добавлен persistent disk)
       # - key: WRITE_DIR
       #   value: "/data"
