@@ -33,13 +33,17 @@ app.use(express.json({ limit: '2mb' })); // подняли лимит
 
 /* CORS */
 const ALLOWED = (process.env.ALLOWED_ORIGINS || 'https://fingercloak.com,https://www.fingercloak.com')
-  .split(',').map(s => s.trim()).filter(Boolean);
+  .split(',')
+  .map(s => s.trim().replace(/\/+$/, '').toLowerCase())
+  .filter(Boolean);
 
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    if (ALLOWED.includes(origin)) return cb(null, true);
-    cb(new Error('CORS blocked'));
+    // браузеры иногда присылают Origin с разным регистром домена — сравниваем без регистра и без хвостовых /
+    const o = (origin || '').trim().replace(/\/+$/, '').toLowerCase();
+    if (!o) return cb(null, true);              // прямой заход без Origin
+    if (ALLOWED.includes(o)) return cb(null, true);
+    return cb(new Error(`CORS blocked: ${origin}`));
   },
   credentials: true
 }));
