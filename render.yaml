@@ -42,18 +42,25 @@ services:
       - key: REDIS_URL
         value: "redis://default:AfU3AAIncDFhMTVkZWY4NDIyMjU0Y2ZkOTM2YTQ1MTYyZGU3OTdiZXAxNjI3NzU@possible-phoenix-62775.upstash.io:6379"
 
-      # GeoIP mmdb (опционально; если не задано — используем geoip-lite)
-      # - key: GEOIP_ASN_DB
-      #   value: "/opt/data/GeoLite2-ASN.mmdb"
-      # - key: GEOIP_CITY_DB
-      #   value: "/opt/data/GeoLite2-City.mmdb"
 
       # Включить RDAP/WHOIS обогащение (через rdap.org)
       - key: RDAP_ENABLE
         value: "1"
       - key: RDAP_TIMEOUT_MS
         value: "4000"
+      # === Chunks/Collect sync ===
+      - key: CHUNKS_TTL_MS          # сколько храним сетевые чанки (edge/dns/webrtc/tls/tcp)
+        value: "15000"              # 15s (можно 25000 на «медленных» сетях)
 
-      # Писать JSONL снапшоты на диск (если добавлен persistent disk)
-      # - key: WRITE_DIR
-      #   value: "/data"
+      - key: COLLECT_WAIT_FOR       # какие чанки дожидаться перед сохранением снимка
+        value: "webrtc,dns,edge,tls,tcp"
+
+      - key: COLLECT_TIMEOUT_MS     # сколько ждать в /api/fp/collect
+        value: "8000"               # 8s (под дружелюбные сети — 6000; под тяжёлые — 12000)
+
+      - key: DNS_SHARED_SECRET
+        sync: false
+      - key: WEBRTC_SHARED_SECRET
+        sync: false
+      - key: TCP_SHARED_SECRET
+        sync: false

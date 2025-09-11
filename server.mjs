@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
+import rateLimit from 'express-rate-limit';
 
 import { sendIndexNow } from './indexnow.mjs';
 import {
@@ -18,10 +19,9 @@ import { handleTlsIngest } from './tls_ingest.mjs';
 import { handleTcpIngest } from './tcp_ingest.mjs';
 
 import { initGeoIP, lookupIp } from './geoip.mjs';
-import { getChunks } from './chunks.mjs';
+import { getChunks, debugStats } from './chunks.mjs';
 import { rdapLookup } from './rdap.mjs';
 import { cymruAsnLookup } from './rdap_cymru.mjs';
-
 
 const app = express();
 
@@ -39,16 +39,18 @@ const ALLOWED = (process.env.ALLOWED_ORIGINS || 'https://fingercloak.com,https:/
 
 app.use(cors({
   origin(origin, cb) {
-    // браузеры иногда присылают Origin с разным регистром домена — сравниваем без регистра и без хвостовых /
     const o = (origin || '').trim().replace(/\/+$/, '').toLowerCase();
-    if (!o) return cb(null, true);              // прямой заход без Origin
+    if (!o) return cb(null, true);     // прямой заход без Origin (curl/health)
     if (ALLOWED.includes(o)) return cb(null, true);
     return cb(new Error(`CORS blocked: ${origin}`));
   },
   credentials: true
 }));
 
-/* Trust proxy (Render) */
+// Разрешаем preflight для всех путей (важно для edge/ingest)
+app.options('*', cors());
+
+/* Trust proxy (Render/CF) */
 if (process.env.TRUST_PROXY !== 'false') {
   app.set('trust proxy', true);
 }
@@ -96,11 +98,11 @@ const COOL_DOWN_MS = 2000;
 const lastByIp = new Map();
 app.post('/api/indexnow', async (req, res) => {
   try {
-    const now = Date.now();
+    const t = Date.now();
     const ip = extractClientIp(req);
     const last = lastByIp.get(ip) || 0;
-    if (now - last < COOL_DOWN_MS) return res.status(429).json({ error: 'Too Many Requests' });
-    lastByIp.set(ip, now);
+    if (t - last < COOL_DOWN_MS) return res.status(429).json({ error: 'Too Many Requests' });
+    lastByIp.set(ip, t);
 
     const { url, urls } = req.body || {};
     const list = [
@@ -119,6 +121,15 @@ app.post('/api/indexnow', async (req, res) => {
 });
 
 /* ---------------- Ingest endpoints ---------------- */
+
+// Лимит частоты только на ingest, чтобы не долбили.
+const ingestLimiter = rateLimit({
+  windowMs: 15 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(['/api/*/ingest'], ingestLimiter);
 
 app.post('/api/edge/ingest', (req, res) => {
   try {
@@ -168,16 +179,21 @@ app.post('/api/tcp/ingest', (req, res) => {
 });
 
 /* ---------------- Fingerprint endpoints ---------------- */
-async function waitUntilChunks(sid, kinds = [], timeoutMs = 1500, stepMs = 120) {
-  if (!sid || !kinds.length || timeoutMs <= 0) return false;
+
+// «Умное ожидание» поступления нужных чанков
+async function waitUntilChunks(sid, kinds = [], timeoutMs = 8000, stepMs = 120) {
+  if (!sid || !kinds.length || timeoutMs <= 0) return { ok:false, ready:[] };
   const t0 = Date.now();
- while (Date.now() - t0 < timeoutMs) {
+  let ready = [];
+  while (Date.now() - t0 < timeoutMs) {
     const parts = await getChunks(sid) || {};
-   if (kinds.every(k => parts?.[k])) return true;
+    ready = kinds.filter(k => !!parts?.[k]);
+    if (ready.length === kinds.length) return { ok:true, ready };
     await new Promise(r => setTimeout(r, stepMs));
   }
-  return false;
+  return { ok:false, ready };
 }
+
 // собрать и вернуть id/хэш/флаги
 app.post('/api/fp/collect', async (req, res) => {
   const ip = extractClientIp(req);
@@ -188,34 +204,38 @@ app.post('/api/fp/collect', async (req, res) => {
   if (!payload || typeof payload !== 'object') {
     return res.status(400).json({ ok: false, error: 'payload required' });
   }
+
   // опциональное ожидание нужных чанков (webrtc,dns,tls,tcp,edge)
- const waitFor = String(req.query.waitFor || '').split(',').map(s => s.trim()).filter(Boolean);
- const timeoutMs = Number(req.query.timeoutMs || 0);
- const sid = payload?.meta?.sessionId || null;
+  const waitFor = String(req.query.waitFor || process.env.COLLECT_WAIT_FOR || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const timeoutMs = Number(req.query.timeoutMs || process.env.COLLECT_TIMEOUT_MS || 8000);
+  const sid = payload?.meta?.sessionId || null;
+
+  let waited = { ok:false, ready:[] };
   if (sid && waitFor.length && timeoutMs > 0) {
-    await waitUntilChunks(sid, waitFor, timeoutMs).catch(()=>{});
- }
+    waited = await waitUntilChunks(sid, waitFor, timeoutMs).catch(()=>({ok:false,ready:[]}));
+  }
+
   // серверные обогащения:
   const { order, hash, sample } = headerOrderAndHash(req.rawHeaders);
   const headersSrv = { order, hash, sample };
 
-let geoSrv = lookupIp(ip) || {};
-let rdap = await rdapLookup({ ip, asn: geoSrv?.asn || null }).catch(() => null);
+  let geoSrv = lookupIp(ip) || {};
+  let rdap = await rdapLookup({ ip, asn: geoSrv?.asn || null }).catch(() => null);
 
-if (process.env.RDAP_FALLBACK_CYMRU === '1' && (!rdap || !rdap.asn || !geoSrv?.asn)) {
-  const asnInfo = await cymruAsnLookup(ip).catch(() => null);
-  if (asnInfo) {
-    rdap = rdap || {};
-    rdap.asn = rdap.asn || asnInfo.asn;
-    rdap.org = rdap.org || asnInfo.org;
-    rdap.rir = rdap.rir || asnInfo.rir;
+  if (process.env.RDAP_FALLBACK_CYMRU === '1' && (!rdap || !rdap.asn || !geoSrv?.asn)) {
+    const asnInfo = await cymruAsnLookup(ip).catch(() => null);
+    if (asnInfo) {
+      rdap = rdap || {};
+      rdap.asn = rdap.asn || asnInfo.asn;
+      rdap.org = rdap.org || asnInfo.org;
+      rdap.rir = rdap.rir || asnInfo.rir;
 
-    if (asnInfo.asn && !geoSrv.asn)   geoSrv.asn = asnInfo.asn;
-    if (asnInfo.org && !geoSrv.isp)   geoSrv.isp = asnInfo.org;
-    if (asnInfo.country && !geoSrv.country) geoSrv.country = asnInfo.country;
+      if (asnInfo.asn && !geoSrv.asn)         geoSrv.asn = asnInfo.asn;
+      if (asnInfo.org && !geoSrv.isp)         geoSrv.isp = asnInfo.org;
+      if (asnInfo.country && !geoSrv.country) geoSrv.country = asnInfo.country;
+    }
   }
-}
-
 
   try {
     const entry = await saveFingerprint({ ip, ua, origin, payload, headersSrv, geoSrv, rdap });
@@ -225,7 +245,8 @@ if (process.env.RDAP_FALLBACK_CYMRU === '1' && (!rdap || !rdap.asn || !geoSrv?.a
       hash: entry.contentHash ?? entry.hash ?? null,
       nonzero: !!entry.nonzero,
       ts: entry.ts,
-      networkFound: entry.networkFound || null
+      networkFound: entry.networkFound || null,
+      waited, // отладка: какие чанки реально дождались
     });
   } catch (e) {
     res.status(400).json({ ok: false, error: String(e.message || e) });
@@ -265,11 +286,16 @@ app.get('/api/fp/debug/chunks/:sid', async (req, res) => {
   }
 });
 
-// И ТОЛЬКО ПОТОМ — “общий” маршрут по id (сузили маску, чтобы не ловить compare/search).
+// Общий маршрут по id (после специфичных путей)
 app.get('/api/fp/:id([A-Za-z0-9_-]{6,64})', (req, res) => {
   const item = getFingerprint(req.params.id);
   if (!item) return res.status(404).json({ ok: false, error: 'not found' });
   res.json(item);
+});
+
+// Диагностика стора чанков
+app.get('/api/fp/debug/stats', (req, res) => {
+  res.json({ ok: true, chunks: debugStats() });
 });
 
 // 404
