@@ -24,6 +24,13 @@ import { rdapLookup } from './rdap.mjs';
 import { cymruAsnLookup } from './rdap_cymru.mjs';
 
 const app = express();
+function getCookie(req, name) {
+  try {
+    const rx = new RegExp('(?:^|; )' + name.replace(/[-[\]/{}()*+?.\\^$|]/g, '\\$&') + '=([^;]*)');
+    const m = (req.headers.cookie || '').match(rx);
+    return m ? decodeURIComponent(m[1]) : null;
+  } catch { return null; }
+}
 
 /* Security headers & logs */
 app.disable('x-powered-by');
@@ -136,6 +143,23 @@ const ingestLimiter = rateLimit({
   legacyHeaders: false,
 });
 app.use(['/api/*/ingest'], ingestLimiter);
+// Нормализуем corrId/sid/sessionId и логируем входящие ingest-запросы
+app.use(['/api/*/ingest'], (req, _res, next) => {
+  const b = req.body || {};
+  const sid =
+    b.corrId ||
+    b.sid ||
+    b.sessionId ||
+    (b.meta && b.meta.sessionId) ||
+    req.headers['x-fc-corr'] ||
+    getCookie(req, 'fc_corr') ||
+    null;
+
+  if (sid) req.body.corrId = String(sid); // ⬅️ единое поле, которое ждут handle*Ingest
+  console.log('[INGEST] path=%s sid=%s keys=%o', req.path, sid || '-', Object.keys(b));
+  next();
+});
+
 
 app.post('/api/edge/ingest', (req, res) => {
   try {
@@ -159,18 +183,23 @@ app.post('/api/tls/ingest', (req, res) => {
 
 app.post('/api/dns/ingest', (req, res) => {
   try {
+    console.log('[INGEST DNS] sid=%s resolvers=%d', req.body?.corrId, (req.body?.resolvers || []).length);
     const result = handleDnsIngest(req.body);
+    console.log('[INGEST DNS] ->', result);
     res.json(result);
   } catch (e) {
+    console.error('[INGEST DNS] ERROR', e);
     res.status(400).json({ ok: false, error: String(e.message || e) });
   }
 });
-
 app.post('/api/webrtc/ingest', (req, res) => {
   try {
+    console.log('[INGEST WebRTC] sid=%s candidates=%d', req.body?.corrId, (req.body?.candidates || []).length);
     const result = handleWebrtcIngest(req.body);
+    console.log('[INGEST WebRTC] ->', result);
     res.json(result);
   } catch (e) {
+    console.error('[INGEST WebRTC] ERROR', e);
     res.status(400).json({ ok: false, error: String(e.message || e) });
   }
 });
