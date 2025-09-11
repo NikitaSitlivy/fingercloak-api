@@ -39,8 +39,8 @@ services:
         sync: false
 
       # Redis (опционально — если несколько инстансов/нужно переживать рестарты/увеличить TTL чанков)
-      # - key: REDIS_URL
-      #   value: "redis://:password@redis-host:6379/0"
+      - key: REDIS_URL
+        value: "redis://default:AfU3AAIncDFhMTVkZWY4NDIyMjU0Y2ZkOTM2YTQ1MTYyZGU3OTdiZXAxNjI3NzU@possible-phoenix-62775.upstash.io:6379"
 
       # GeoIP mmdb (опционально; если не задано — используем geoip-lite)
       # - key: GEOIP_ASN_DB
