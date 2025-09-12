@@ -2,9 +2,9 @@
 import { normalizePayload } from './normalize.mjs';
 import { hmacIp as anonIp, makeStableId, makeContentHash, hammingDistanceHex } from './hashing.mjs';
 import { saveSnapshot, getById, getBySession, search as storeSearch, stats as storeStats } from './store.mjs';
-import { takeChunks } from './chunks.mjs';
+import { getChunks } from './chunks.mjs'; // ВАЖНО: lease-чтение (НЕ удаляет)
 
-const VERSION = '1.3.1';
+const VERSION = '1.4.0';
 
 // утилита для IP (учитываем прокси, если включён trust proxy)
 export function extractClientIp(req) {
@@ -24,7 +24,8 @@ export function getVersionInfo() {
  *  - geoSrv:     { asn, isp, country, region, city }
  *  - rdap:       { asn, org, country, rir }
  *
- * и склеивает частичные чанки (edge/dns/webrtc/tls/tcp) по sessionId (corrId).
+ * и склеивает частичные чанки (edge/dns/webrtc/tls/tcp) по sessionId (corrId)
+ * через НЕразрушающее чтение (lease).
  */
 export async function saveFingerprint({ ip, ua, origin = null, payload, headersSrv = null, geoSrv = null, rdap = null }) {
   // 1) нормализуем «сырой» снимок из лаборатории
@@ -34,27 +35,28 @@ export async function saveFingerprint({ ip, ua, origin = null, payload, headersS
   const sessionId = payload?.meta?.sessionId || null;
   const consent = payload?.consent || null;
 
-  // 3) подтянем частичные чанки (edge/dns/webrtc/tls/tcp), если они приходили до collect
-  const chunks = sessionId ? await takeChunks(sessionId) : null;
+  // 3) подтянем частичные чанки (edge/dns/webrtc/tls/tcp), НЕ удаляя их
+  const parts = sessionId ? (await getChunks(sessionId)) : null;
 
   // 4) соберём network-раздел
-const network = {};
- // сначала подшиваем edge/dns/webrtc/tls/tcp
- if (chunks?.edge)   network.edge   = chunks.edge;
-  if (chunks?.dns)    network.dns    = chunks.dns;
- if (chunks?.webrtc) network.webrtc = chunks.webrtc;
-  if (chunks?.tls)    network.tls    = chunks.tls;
- if (chunks?.tcp)    network.tcp    = chunks.tcp;
+  const network = {};
 
- // headers: если edge.headers уже есть — не дублируем headersSrv
+  // (а) «живые» части, пришедшие через ingest
+  if (parts?.edge)   network.edge   = parts.edge;
+  if (parts?.dns)    network.dns    = parts.dns;
+  if (parts?.webrtc) network.webrtc = parts.webrtc;
+  if (parts?.tls)    network.tls    = parts.tls;
+  if (parts?.tcp)    network.tcp    = parts.tcp;
+
+  // (б) серверные обогащения (если edge не предоставил аналогичные)
   const haveEdgeHeaders = !!network.edge?.headers;
   if (!haveEdgeHeaders && headersSrv) network.headersSrv = headersSrv;
 
- // geo: если edge.geo есть — не добавляем geoSrv
- const haveEdgeGeo = !!network.edge?.geo;
- if (!haveEdgeGeo && geoSrv) network.geoSrv = geoSrv;
+  const haveEdgeGeo = !!network.edge?.geo;
+  if (!haveEdgeGeo && geoSrv) network.geoSrv = geoSrv;
 
- if (rdap) network.rdap = rdap;
+  if (rdap) network.rdap = rdap;
+
   if (Object.keys(network).length) {
     normalized.network = network;
   }
@@ -166,6 +168,8 @@ export function searchSnapshots(query) {
   return storeSearch(query);
 }
 
+// getSession оставляем как есть (по снимкам), т.к. фронт уже опрашивает /api/fp/debug/chunks/:sid
+// и объединяет результаты; это не требует правок server.mjs.
 export function getSession(sessionId) {
   const items = getBySession(sessionId);
   if (!items.length) return null;
