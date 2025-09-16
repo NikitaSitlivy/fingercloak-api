@@ -183,7 +183,13 @@ app.post('/api/tls/ingest', (req, res) => {
 
 app.post('/api/dns/ingest', (req, res) => {
   try {
-    console.log('[INGEST DNS] sid=%s resolvers=%d', req.body?.corrId, (req.body?.resolvers || []).length);
+    console.log(
+  '[INGEST DNS] sid=%s method=%s resolvers=%d doh=%d',
+  req.body?.corrId,
+  req.body?.method,
+  (req.body?.resolvers || []).length,
+  (req.body?.dohResults || []).length
+);
     const result = handleDnsIngest(req.body);
     console.log('[INGEST DNS] ->', result);
     res.json(result);
