@@ -2,6 +2,8 @@
 // Приём списка резолверов из авторитативных логов и активных DoH-проб (DNS).
 
 import { addChunk } from './chunks.mjs';
+import { lookupIp } from './geoip.mjs';
+import { cymruAsnLookup } from './rdap_cymru.mjs';
 
 /* ------------ utils ------------ */
 function normStr(x, max = 256) {
@@ -23,6 +25,18 @@ function oneOf(x, allowed) {
   const s = typeof x === 'string' ? x.toLowerCase().trim() : '';
   return allowed.includes(s) ? s : null;
 }
+function ipVersion(ip) {
+  if (!ip || typeof ip !== 'string') return null;
+  return ip.includes(':') ? 6 : 4;
+}
+function normEcs(x) {
+  // ECS как "a.b.c.d/nn" или "xxxx::/nn" → оставляем строкой, режем до 64
+  const s = normStr(x, 64);
+  if (!s) return null;
+  // мини-фильтр мусора
+  if (!/^[0-9a-f:.]+\/\d{1,3}$/i.test(s)) return null;
+  return s;
+}
 
 /**
  * Ожидаемый payload:
@@ -33,68 +47,88 @@ function oneOf(x, allowed) {
  *   resolvers: [
  *     {
  *       ip: "8.8.8.8", asn: "AS15169", isp: "Google LLC", country: "NL", v: 4,
- *       // расширенные поля (опц.)
  *       proto: "doh"|"udp"|"dot",
  *       dohName: "Google", dohEndpoint: "https://dns.google/resolve",
  *       verified: true, rttMs: 42,
- *       // сигналы авторитативного слоя (если есть)
- *       ecs: "1.2.3.0/24",         // EDNS ECS (как строка)
- *       ednsDo: true,              // DO-бит (DNSSEC OK)
- *       qnameMin: true,            // QNAME minimization
- *       ttl1: 300, ttl2: 298       // пример для кэш-теста (необязательно)
+ *       ecs: "1.2.3.0/24", ednsDo: true, qnameMin: true, ttl1: 300, ttl2: 298
  *     }
  *   ],
- *   // опционально для активных DoH-проб
- *   dohResults: [
- *     { name:"Google", endpoint:"https://dns.google/resolve", ok:true, rttMs:42, status:200 }
- *   ],
- *   // опционально сводка по кодам ответов из авторитативных логов
+ *   dohResults: [{ name, endpoint, ok, rttMs, status }],
  *   rcodeCounts: { NOERROR: 12, NXDOMAIN: 3 }
  * }
  */
-export function handleDnsIngest(body = {}) {
+export async function handleDnsIngest(body = {}) {
   const corrId = normStr(body.corrId, 128);
   if (!corrId) throw new Error('dns_ingest: corrId required');
 
-  const method = normStr(body.method, 64) || 'authoritative-logs';
+  const method = oneOf(body.method, ['authoritative-logs', 'passive', 'active']) || 'authoritative-logs';
   const tookMs = normInt(body.tookMs);
 
   // Нормализуем и дедуплицируем резолверы по ключу ip|proto|endpoint
   const seen = new Set();
-  const resolvers = clamp(body.resolvers, 2000)
-    .map((r) => {
-      const ip = normStr(r?.ip, 64);
-      if (!ip) return null;
+  const rawResolvers = clamp(body.resolvers, 2000);
 
-      const item = {
-        ip,
-        asn:     normStr(r?.asn, 32),
-        isp:     normStr(r?.isp, 128),
-        country: normStr(r?.country, 64),
-        v:       r?.v === 6 ? 6 : 4,
+  const resolvers = [];
+  for (const r of rawResolvers) {
+    const ip = normStr(r?.ip, 64);
+    if (!ip) continue;
 
-        // активные поля (если есть — сохраняем)
-        proto:       oneOf(r?.proto, ['udp', 'doh', 'dot']),
-        dohName:     normStr(r?.dohName, 64),
-        dohEndpoint: normStr(r?.dohEndpoint, 512),
-        verified:    r?.verified === true,           // только true фиксируем как true
-        rttMs:       normInt(r?.rttMs),
+    const v = r?.v === 6 ? 6 : (r?.v === 4 ? 4 : ipVersion(ip) || 4);
 
-        // сигналы из авторитативного слоя (все опц.)
-        ecs:       normStr(r?.ecs, 64),
-        ednsDo:    normBool(r?.ednsDo),
-        qnameMin:  normBool(r?.qnameMin),
-        ttl1:      normInt(r?.ttl1),
-        ttl2:      normInt(r?.ttl2),
-      };
+    const item = {
+      ip,
+      asn:     normStr(r?.asn, 32),
+      isp:     normStr(r?.isp, 128),
+      country: normStr(r?.country, 64),
+      v,
 
-      // ключ для дедупа
-      const k = [item.ip, item.proto || '-', item.dohEndpoint || '-'].join('|');
-      if (seen.has(k)) return null;
-      seen.add(k);
-      return item;
-    })
-    .filter(Boolean);
+      proto:       oneOf(r?.proto, ['udp', 'doh', 'dot']),
+      dohName:     normStr(r?.dohName, 64),
+      dohEndpoint: normStr(r?.dohEndpoint, 512),
+      verified:    r?.verified === true,
+      rttMs:       normInt(r?.rttMs),
+
+      ecs:       normEcs(r?.ecs),
+      ednsDo:    normBool(r?.ednsDo),
+      qnameMin:  normBool(r?.qnameMin),
+      ttl1:      normInt(r?.ttl1),
+      ttl2:      normInt(r?.ttl2),
+    };
+
+    // enrich ASN/Geo если не пришло
+    if (!item.asn || !item.country || !item.isp) {
+      const g = lookupIp(ip) || {};
+      if (!item.asn && g.asn) item.asn = String(g.asn);
+      if (!item.country && g.country) item.country = normStr(g.country, 64);
+      if (!item.isp && g.isp) item.isp = normStr(g.isp, 128);
+    }
+
+    // при необходимости — fallback через Team Cymru
+    if ((!item.asn || !item.isp || !item.country) && process.env.DNS_ENRICH_FALLBACK_CYMRU === '1') {
+      try {
+        const c = await cymruAsnLookup(ip);
+        if (c) {
+          if (!item.asn && c.asn) item.asn = String(c.asn);
+          if (!item.isp && c.org) item.isp = normStr(c.org, 128);
+          if (!item.country && c.country) item.country = normStr(c.country, 64);
+        }
+      } catch { /* ignore */ }
+    }
+
+    const k = [item.ip, item.proto || '-', item.dohEndpoint || '-'].join('|');
+    if (seen.has(k)) continue;
+    seen.add(k);
+    resolvers.push(item);
+  }
+
+  // Сортировка: verified desc → rtt asc → proto
+  resolvers.sort((a, b) => {
+    if (a.verified !== b.verified) return b.verified - a.verified;
+    const ar = a.rttMs ?? Number.POSITIVE_INFINITY;
+    const br = b.rttMs ?? Number.POSITIVE_INFINITY;
+    if (ar !== br) return ar - br;
+    return String(a.proto || '').localeCompare(String(b.proto || ''));
+  });
 
   // Сводка DoH-запросов (необязательная)
   const dohResults = clamp(body.dohResults, 200)
